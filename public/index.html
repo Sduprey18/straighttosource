@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f2f0e9" />
+  <title>Right to Source</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main>
+    <nav><a href="/" class="brand"><span>R/</span> Right to Source</a><span class="status"><i></i> Ready</span></nav>
+    <section class="workspace">
+      <div class="intro">
+        <p class="eyebrow">JOBRIGHT / SIMPLIFY → EMPLOYER</p>
+        <h1>Skip the middleman.</h1>
+        <p class="lede">Paste a Jobright or Simplify listing. Get the original employer posting.</p>
+      </div>
+      <form id="resolver-form">
+        <label for="job-url">Jobright or Simplify link</label>
+        <div class="input-row">
+          <input id="job-url" name="url" type="url" inputmode="url" autocomplete="url" placeholder="https://jobright.ai/… or https://simplify.jobs/…" required />
+          <button type="submit"><span>Find source</span><b>↗</b></button>
+        </div>
+        <p id="message" class="message">Nothing is stored. One link in, one link out.</p>
+      </form>
+      <section id="result" class="result" hidden aria-live="polite">
+        <div><p class="eyebrow">ORIGINAL POSTING</p><h2 id="result-title"></h2><p id="result-host"></p></div>
+        <a id="result-link" target="_blank" rel="noopener noreferrer"><b id="result-action">Open posting</b> <span>↗</span></a>
+      </section>
+    </section>
+    <footer><span>Built for a cleaner job hunt.</span><span>01 — SOURCE FINDER</span></footer>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
