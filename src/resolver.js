@@ -9,6 +9,10 @@ const ATS_HINTS = [
   'icims.com', 'bamboohr.com', 'jobvite.com', 'applytojob.com'
 ];
 const AGGREGATORS = ['indeed.com', 'ziprecruiter.com', 'glassdoor.com', 'builtin.com', 'talent.com', 'jooble.org', 'simplyhired.com'];
+const NON_JOB_HOSTS = [
+  ...AGGREGATORS, 'linkedin.com', 'facebook.com', 'twitter.com', 'x.com',
+  'crunchbase.com', 'youtube.com', 'instagram.com'
+];
 const RESULT_CACHE_TTL = 6 * 60 * 60 * 1_000;
 const RESULT_CACHE_LIMIT = 200;
 const resultCache = new Map();
@@ -47,18 +51,60 @@ function extractTitle(html) {
   return match ? decode(match[1]).replace(/\s*\|\s*Jobright.*$/i, '').trim() : 'Original job posting';
 }
 
+function hostMatches(host, domain) {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+function isGenericJobsUrl(candidate) {
+  try {
+    const url = new URL(candidate);
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    if (/^\/(?:jobs?|careers?|opportunities|open-roles?|join-us|work-with-us)?$/i.test(path)) return true;
+    if (/(?:^|\/)(?:search|job-search|jobs-search|find-jobs|open-positions)(?:\/|$)/i.test(path)) return true;
+    if (/^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(?:jobs?|careers?)$/i.test(path)) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function isSpecificJobUrl(candidate) {
+  let url;
+  try { url = new URL(candidate); } catch { return false; }
+  if (!['http:', 'https:'].includes(url.protocol) || isGenericJobsUrl(candidate)) return false;
+  const host = url.hostname.replace(/^www\./, '');
+  if (NON_JOB_HOSTS.some(item => hostMatches(host, item))) return false;
+
+  const hasJobIdentifier = [...url.searchParams.keys()].some(key =>
+    /^(?:gh_jid|job_?id|jid|posting_?id|position_?id|requisition_?id|req_?id)$/i.test(key)
+      && url.searchParams.get(key)
+  );
+  if (hasJobIdentifier) return true;
+
+  const segments = url.pathname.split('/').filter(Boolean);
+  const markerIndex = segments.findIndex(segment =>
+    /^(?:jobs?|positions?|postings?|requisitions?|details?|vacancies|opportunities|apply)$/i.test(segment)
+  );
+  if (markerIndex >= 0 && segments.length > markerIndex + 1) return true;
+
+  const isAts = ATS_HINTS.some(item => hostMatches(host, item));
+  return isAts && segments.length >= 2;
+}
+
 function score(candidate) {
   let url;
   try { url = new URL(candidate); } catch { return -Infinity; }
   const host = url.hostname.replace(/^www\./, '');
   if (!['http:', 'https:'].includes(url.protocol)) return -Infinity;
-  if (BLOCKED_HOSTS.some(item => host === item || host.endsWith(`.${item}`))) return -Infinity;
+  if (BLOCKED_HOSTS.some(item => hostMatches(host, item))) return -Infinity;
   let points = 0;
-  if (ATS_HINTS.some(item => host.endsWith(item))) points += 100;
+  if (ATS_HINTS.some(item => hostMatches(host, item))) points += 100;
   if (/\b(job|jobs|career|careers|position|posting|apply|requisition)\b/i.test(url.href)) points += 35;
   if (/\.(js|css|png|jpe?g|svg|webp|woff2?|ico)(\?|$)/i.test(url.pathname)) points -= 200;
   if (/privacy|terms|support|help|blog|news/i.test(url.pathname)) points -= 70;
   if (url.searchParams.has('gh_jid') || url.searchParams.has('jobId')) points += 30;
+  if (isGenericJobsUrl(candidate)) points -= 200;
+  if (isSpecificJobUrl(candidate)) points += 80;
   return points;
 }
 
@@ -67,21 +113,55 @@ function extractCandidates(html) {
   const matches = decoded.match(/https?:\/\/[^\s"'<>\\]+/g) || [];
   return [...new Set(matches.map(raw => raw.replace(/[),;]+$/, '')))]
     .map(url => ({ url, score: score(url) }))
-    .filter(item => item.score > 0)
+    .filter(item => item.score > 0 && isSpecificJobUrl(item.url))
     .sort((a, b) => b.score - a.score);
 }
 
+function parseScriptJson(html, id) {
+  const pattern = new RegExp(`<script[^>]+id=["']${id}["'][^>]*>([\\s\\S]*?)<\\/script>`, 'i');
+  const match = html.match(pattern);
+  if (!match) return null;
+  try { return JSON.parse(match[1]); } catch { return null; }
+}
+
+function extractJsonLdJob(html) {
+  for (const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      const items = Array.isArray(parsed) ? parsed : parsed['@graph'] || [parsed];
+      const posting = items.find(item => {
+        const type = item?.['@type'];
+        return type === 'JobPosting' || (Array.isArray(type) && type.includes('JobPosting'));
+      });
+      if (posting) return posting;
+    } catch {}
+  }
+  return null;
+}
+
 function extractJobData(html) {
-  const match = html.match(/<script[^>]+id=["']job-posting["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (!match) return {};
-  try {
-    const data = JSON.parse(match[1]);
-    return {
-      title: data.title || '',
-      company: data.hiringOrganization?.name || '',
-      companyUrl: data.hiringOrganization?.sameAs || ''
-    };
-  } catch { return {}; }
+  const legacy = parseScriptJson(html, 'job-posting') || {};
+  const jsonLd = extractJsonLdJob(html) || {};
+  const helper = parseScriptJson(html, 'jobright-helper-job-detail-info') || {};
+  const nextData = parseScriptJson(html, '__NEXT_DATA__') || {};
+  const jobright = helper.jobResult || {};
+  const jobrightCompany = helper.companyResult || {};
+  const simplify = nextData.props?.pageProps?.jobPosting || {};
+  const structured = Object.keys(jsonLd).length ? jsonLd : legacy;
+  const validThrough = structured.validThrough ? Date.parse(structured.validThrough) : NaN;
+  const textSaysClosed = /(?:this|the) job (?:has closed|is closed|is no longer (?:available|accepting applications))/i.test(html);
+
+  return {
+    title: jobright.jobTitle || simplify.title || structured.title || '',
+    company: jobrightCompany.companyName || structured.hiringOrganization?.name || '',
+    companyUrl: jobrightCompany.companyURL || structured.hiringOrganization?.sameAs || '',
+    applicationUrl: jobright.applyLink || jobright.originalUrl || '',
+    isClosed: jobright.isDeleted === true
+      || simplify.active === false
+      || (simplify.active == null && simplify.visible === false)
+      || (Number.isFinite(validThrough) && validThrough < Date.now())
+      || textSaysClosed
+  };
 }
 
 function searchScore(candidate, job) {
@@ -169,6 +249,20 @@ function companySlugs(job) {
   return [...new Set(slugs.filter(Boolean))];
 }
 
+function companyTerms(job) {
+  return [...new Set(
+    String(job.company || '')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(term => term.length >= 4 && !['company', 'group', 'holdings', 'services', 'technologies'].includes(term))
+  )];
+}
+
+function isCompanyBrandedHost(host, job) {
+  const labels = host.toLowerCase().split('.');
+  return companyTerms(job).some(term => labels.some(label => label === term || label.startsWith(`${term}-`)));
+}
+
 async function discoverFromAts(job, fetcher) {
   const requests = companySlugs(job).flatMap(slug => [
     { kind: 'greenhouse', url: `https://boards-api.greenhouse.io/v1/boards/${slug}/jobs?content=false` },
@@ -202,12 +296,11 @@ function officialLinkScore(link, job, companyHost) {
   if (!['http:', 'https:'].includes(url.protocol)) return -Infinity;
 
   const host = url.hostname.replace(/^www\./, '');
-  const belongsToCompany = companyHost && (host === companyHost || host.endsWith(`.${companyHost}`));
-  const isAts = ATS_HINTS.some(item => host === item || host.endsWith(`.${item}`));
-  if (!belongsToCompany && !isAts) return -Infinity;
-  if (/\/(?:careers?|jobs?)(?:\/(?:students?|internships?|opportunities|open-roles?))?\/?$/i.test(url.pathname)) {
-    return -Infinity;
-  }
+  const belongsToCompany = companyHost && hostMatches(host, companyHost);
+  const isAts = ATS_HINTS.some(item => hostMatches(host, item));
+  const isCompanyBrand = isCompanyBrandedHost(host, job);
+  if (!belongsToCompany && !isAts && !isCompanyBrand) return -Infinity;
+  if (!isSpecificJobUrl(link.url)) return -Infinity;
 
   const textMatch = titleMatchScore(job.title, link.text);
   let decodedPath = url.pathname;
@@ -220,6 +313,7 @@ function officialLinkScore(link, job, companyHost) {
   points += pathMatch * 180;
   if (isAts) points += 100;
   if (belongsToCompany) points += 60;
+  if (isCompanyBrand) points += 50;
   return points;
 }
 
@@ -227,8 +321,8 @@ function isCareersPage(link, companyHost) {
   try {
     const url = new URL(link.url);
     const host = url.hostname.replace(/^www\./, '');
-    const belongsToCompany = host === companyHost || host.endsWith(`.${companyHost}`);
-    const isAts = ATS_HINTS.some(item => host === item || host.endsWith(`.${item}`));
+    const belongsToCompany = hostMatches(host, companyHost);
+    const isAts = ATS_HINTS.some(item => hostMatches(host, item));
     return (belongsToCompany || isAts)
       && /(?:^|\/)(?:careers?|jobs?|join-us|open-roles?|work-with-us)(?:\/|$)/i.test(url.pathname);
   } catch {
@@ -252,6 +346,43 @@ async function fetchHtml(url, fetcher) {
     return await response.text();
   } catch {
     return null;
+  }
+}
+
+function closedJobError() {
+  const error = new Error('This job is closed and is no longer accepting applications.');
+  error.code = 'JOB_CLOSED';
+  return error;
+}
+
+async function verifyResolvedUrl(candidate, job, fetcher) {
+  if (!candidate || !isSpecificJobUrl(candidate)) return null;
+
+  try {
+    const response = await fetcher(candidate, {
+      redirect: 'follow',
+      headers: {
+        'user-agent': 'Mozilla/5.0 (compatible; RightToSource/1.0)',
+        accept: 'text/html,application/xhtml+xml'
+      },
+      signal: AbortSignal.timeout(7_000)
+    });
+    if (!response.ok) return candidate;
+
+    const finalUrl = response.url || candidate;
+    if (!isSpecificJobUrl(finalUrl)) return null;
+    const contentType = response.headers?.get?.('content-type') || '';
+    if (contentType && !contentType.includes('html')) return finalUrl;
+
+    const html = await response.text();
+    const destination = extractJobData(html);
+    if (destination.isClosed) throw closedJobError();
+    if (destination.title && job.title && titleMatchScore(job.title, destination.title) < 0.45) return null;
+    return finalUrl;
+  } catch (error) {
+    if (error?.code === 'JOB_CLOSED') throw error;
+    // Many ATS sites reject server-side checks while the same job URL works in a browser.
+    return candidate;
   }
 }
 
@@ -402,6 +533,7 @@ async function resolveJobrightUrlUncached(input, fetcher) {
     const error = new Error('That does not look like a Jobright or Simplify job posting URL.'); error.code = 'BAD_URL'; throw error;
   }
 
+  let simplifyRedirect = null;
   if (simplifyMatch) {
     try {
       const redirect = await fetcher(`https://simplify.jobs/jobs/click/${simplifyMatch[1]}`, {
@@ -410,14 +542,7 @@ async function resolveJobrightUrlUncached(input, fetcher) {
         signal: AbortSignal.timeout(10_000)
       });
       const location = redirect.headers?.get?.('location');
-      if (location && score(location) > 0) {
-        return {
-          url: location,
-          title: source.pathname.split('/').slice(3).join(' ').replace(/-/g, ' ') || 'Original job posting',
-          source: new URL(location).hostname.replace(/^www\./, ''),
-          isSearchFallback: false
-        };
-      }
+      if (location && isSpecificJobUrl(location)) simplifyRedirect = location;
     } catch {}
   }
 
@@ -426,14 +551,40 @@ async function resolveJobrightUrlUncached(input, fetcher) {
     headers: { 'user-agent': 'Mozilla/5.0 (compatible; RightToSource/1.0)', accept: 'text/html,application/xhtml+xml' },
     signal: AbortSignal.timeout(12_000)
   });
-  if (!response.ok) throw new Error(`${isJobright ? 'Jobright' : 'Simplify'} returned ${response.status}. Try again in a moment.`);
+  if (!response.ok) {
+    if (simplifyRedirect) {
+      return {
+        url: simplifyRedirect,
+        title: source.pathname.split('/').slice(3).join(' ').replace(/-/g, ' ') || 'Original job posting',
+        source: new URL(simplifyRedirect).hostname.replace(/^www\./, ''),
+        isSearchFallback: false
+      };
+    }
+    throw new Error(`${isJobright ? 'Jobright' : 'Simplify'} returned ${response.status}. Try again in a moment.`);
+  }
   const html = await response.text();
-  const candidates = extractCandidates(html);
   const job = extractJobData(html);
-  const resolvedUrl = candidates[0]?.url
-    || await discoverFromAts(job, fetcher)
-    || await discoverFromCompanySite(job, fetcher)
-    || await findViaSearch(job, fetcher);
+  if (job.isClosed) throw closedJobError();
+  if (!job.title) job.title = extractTitle(html);
+
+  const embeddedCandidates = [
+    simplifyRedirect,
+    job.applicationUrl,
+    ...extractCandidates(html).map(item => item.url)
+  ].filter(Boolean);
+  let resolvedUrl = null;
+  for (const candidate of embeddedCandidates) {
+    resolvedUrl = await verifyResolvedUrl(candidate, job, fetcher);
+    if (resolvedUrl) break;
+  }
+
+  const discoverers = [discoverFromAts, discoverFromCompanySite, findViaSearch];
+  for (const discover of discoverers) {
+    if (resolvedUrl) break;
+    const candidate = await discover(job, fetcher);
+    resolvedUrl = await verifyResolvedUrl(candidate, job, fetcher);
+  }
+
   if (!resolvedUrl) throw new Error('The official employer URL could not be verified yet. Please try again in a moment.');
   return { url: resolvedUrl, title: extractTitle(html), source: new URL(resolvedUrl).hostname.replace(/^www\./, ''), isSearchFallback: false };
 }
@@ -472,5 +623,8 @@ module.exports = {
   findViaSearch,
   extractPageLinks,
   unwrapYahooUrl,
-  score
+  score,
+  isSpecificJobUrl,
+  isGenericJobsUrl,
+  verifyResolvedUrl
 };

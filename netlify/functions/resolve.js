@@ -19,7 +19,7 @@ exports.handler = async event => {
     const result = await resolveJobrightUrl(payload.url);
     return response(200, result);
   } catch (error) {
-    const status = error.code === 'BAD_URL' ? 400 : 422;
+    const status = error.code === 'BAD_URL' ? 400 : error.code === 'JOB_CLOSED' ? 410 : 422;
     return response(status, { error: error.message || 'Could not resolve that posting.' });
   }
 };

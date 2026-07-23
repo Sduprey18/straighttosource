@@ -1,6 +1,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { extractCandidates, extractTitle, resolveJobrightUrl, titleMatchScore } = require('../src/resolver');
+const {
+  extractCandidates,
+  extractJobData,
+  extractTitle,
+  isSpecificJobUrl,
+  resolveJobrightUrl,
+  titleMatchScore,
+  verifyResolvedUrl
+} = require('../src/resolver');
 
 test('ranks an ATS job URL above unrelated links', () => {
   const html = '<a href="https://example.com/blog">x</a><script>{"applyUrl":"https:\\/\\/boards.greenhouse.io\\/acme\\/jobs\\/123"}</script>';
@@ -27,12 +35,102 @@ test('rejects non-Jobright input', async () => {
 
 test('resolves a Simplify posting through its direct click redirect', async () => {
   const fakeFetch = async url => {
-    assert.match(String(url), /simplify\.jobs\/jobs\/click\/702c05a8/);
-    return { status:307, headers:{ get:name => name === 'location' ? 'https://jobs.ashbyhq.com/january/job-id/application?utm_source=Simplify' : null } };
+    if (String(url).includes('/jobs/click/702c05a8')) {
+      return { status:307, headers:{ get:name => name === 'location' ? 'https://jobs.ashbyhq.com/january/job-id/application?utm_source=Simplify' : null } };
+    }
+    if (String(url).includes('/p/702c05a8')) {
+      return {
+        ok:true,
+        text:async () => '<title>Software Engineer | Simplify</title><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobPosting":{"title":"Software Engineer","active":true}}}}</script>'
+      };
+    }
+    return { ok:false, status:403 };
   };
   const result = await resolveJobrightUrl('https://simplify.jobs/p/702c05a8-f884-4a1b-ae93-29a370a5442f/Software-Engineer', fakeFetch);
   assert.equal(result.url, 'https://jobs.ashbyhq.com/january/job-id/application?utm_source=Simplify');
   assert.equal(result.source, 'jobs.ashbyhq.com');
+});
+
+test('reads Jobright current structured job data and its closed state', () => {
+  const html = '<script id="jobright-helper-job-detail-info" type="application/json">{"jobResult":{"jobTitle":"Platform Engineer","isDeleted":true},"companyResult":{"companyName":"Acme","companyURL":"https://acme.example"}}</script>';
+  assert.deepEqual(extractJobData(html), {
+    title:'Platform Engineer',
+    company:'Acme',
+    companyUrl:'https://acme.example',
+    applicationUrl:'',
+    isClosed:true
+  });
+});
+
+test('reports a closed Jobright posting instead of a generic verification failure', async () => {
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls++;
+    return {
+      ok:true,
+      text:async () => '<title>Software Engineer @ Apple | Jobright.ai</title><script id="jobright-helper-job-detail-info" type="application/json">{"jobResult":{"jobTitle":"Software Engineer","isDeleted":true},"companyResult":{"companyName":"Apple","companyURL":"https://apple.com"}}</script>'
+    };
+  };
+  await assert.rejects(
+    () => resolveJobrightUrl('https://jobright.ai/jobs/info/closed-id', fakeFetch),
+    /job is closed/
+  );
+  assert.equal(calls, 1);
+});
+
+test('reports a closed Simplify posting even when its click route still redirects', async () => {
+  const fakeFetch = async url => {
+    if (String(url).includes('/jobs/click/')) {
+      return { headers:{ get:name => name === 'location' ? 'https://jobs.example.com/jobs/123' : null } };
+    }
+    return {
+      ok:true,
+      text:async () => '<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobPosting":{"title":"Engineer","active":false,"visible":false}}}}</script>'
+    };
+  };
+  await assert.rejects(
+    () => resolveJobrightUrl('https://simplify.jobs/p/702c05a8-f884-4a1b-ae93-29a370a5442f/Engineer', fakeFetch),
+    /job is closed/
+  );
+});
+
+test('rejects generic careers and search pages as job destinations', async () => {
+  assert.equal(isSpecificJobUrl('https://jobs.apple.com/en-us/search'), false);
+  assert.equal(isSpecificJobUrl('https://example.com/careers'), false);
+  assert.equal(isSpecificJobUrl('https://jobs.apple.com/en-us/details/12345'), true);
+  const redirected = await verifyResolvedUrl(
+    'https://jobs.example.com/jobs/12345',
+    { title:'Software Engineer' },
+    async () => ({
+      ok:true,
+      url:'https://example.com/careers',
+      headers:{ get:() => 'text/html' },
+      text:async () => '<title>Careers</title>'
+    })
+  );
+  assert.equal(redirected, null);
+});
+
+test('finds an official job on a company-branded jobs domain', async () => {
+  const fakeFetch = async url => {
+    const value = String(url);
+    if (value.includes('jobright.ai/jobs/info')) {
+      return {
+        ok:true,
+        text:async () => '<title>Data Center Controls Technician @ Amazon | Jobright.ai</title><script id="jobright-helper-job-detail-info" type="application/json">{"jobResult":{"jobTitle":"Data Center Controls Technician","isDeleted":false},"companyResult":{"companyName":"Amazon","companyURL":"https://amazon.com"}}</script>'
+      };
+    }
+    if (value.includes('search.yahoo.com')) {
+      return {
+        ok:true,
+        text:async () => '<a href="https://www.amazon.jobs/en/jobs/3186055/data-center-controls-technician">Data Center Controls Technician - Amazon Jobs</a>'
+      };
+    }
+    if (value.includes('amazon.jobs/en/jobs/3186055')) return { ok:false, status:403 };
+    return { ok:false, status:404 };
+  };
+  const result = await resolveJobrightUrl('https://jobright.ai/jobs/info/amazon-id', fakeFetch);
+  assert.equal(result.url, 'https://www.amazon.jobs/en/jobs/3186055/data-center-controls-technician');
 });
 
 test('resolves a posting from embedded page data', async () => {

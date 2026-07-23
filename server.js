@@ -27,7 +27,7 @@ const server = http.createServer(async (req, res) => {
         const result = await resolveJobrightUrl(jobrightUrl);
         json(res, 200, result);
       } catch (error) {
-        const status = error.code === 'BAD_URL' ? 400 : 422;
+        const status = error.code === 'BAD_URL' ? 400 : error.code === 'JOB_CLOSED' ? 410 : 422;
         json(res, status, { error: error.message || 'Could not resolve that posting.' });
       }
     });
